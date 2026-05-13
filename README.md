@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/catitodev/greenops-auto-remediator/main/assets/logo-greenops.svg" alt="GreenOps Logo" width="120" height="120">
+  <img src="https://raw.githubusercontent.com/catitodev/greenops-auto-remediator/main/assets/logo-greenops.jpeg" alt="GreenOps Logo" width="120" height="120">
 </p>
 
 <h1 align="center">GreenOps Auto-Remediator</h1>
