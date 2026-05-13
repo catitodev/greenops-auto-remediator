@@ -1,0 +1,70 @@
+# =============================================================================
+# GreenOps Auto-Remediador — Dependências de Desenvolvimento
+# =============================================================================
+# Instale com: pip install -r requirements-dev.txt
+# Inclui todas as dependências de produção mais ferramentas de dev/test.
+# =============================================================================
+
+# Inclui as dependências de produção
+-r requirements.txt
+
+# -----------------------------------------------------------------------------
+# Testes
+# -----------------------------------------------------------------------------
+
+# Framework de testes principal
+pytest>=8.0.0
+
+# Plugin de cobertura de código para pytest
+pytest-cov>=5.0.0
+
+# Mock de serviços AWS para testes unitários sem chamadas reais à AWS
+# Suporta: EC2, S3, DynamoDB, Lambda, SNS, SQS, IAM, CloudWatch, etc.
+moto[all]>=5.0.0
+
+# -----------------------------------------------------------------------------
+# Qualidade de código — linting
+# -----------------------------------------------------------------------------
+
+# Linter PEP8 — verifica estilo e erros de sintaxe
+flake8>=7.0.0
+
+# Linter avançado — detecta bugs, code smells e violações de boas práticas
+pylint>=3.0.0
+
+# -----------------------------------------------------------------------------
+# Segurança
+# -----------------------------------------------------------------------------
+
+# Análise estática de segurança — detecta vulnerabilidades comuns no código Python
+bandit>=1.7.0
+
+# -----------------------------------------------------------------------------
+# Formatação de código
+# -----------------------------------------------------------------------------
+
+# Formatador de código opinativo — garante estilo consistente
+black>=24.0.0
+
+# Organiza e ordena imports automaticamente
+isort>=5.13.0
+
+# -----------------------------------------------------------------------------
+# Tipagem estática
+# -----------------------------------------------------------------------------
+
+# Verificador de tipos estáticos para Python
+mypy>=1.8.0
+
+# Stubs de tipos para boto3/botocore (necessário para mypy)
+boto3-stubs[essential]>=1.34.0
+
+# -----------------------------------------------------------------------------
+# Documentação
+# -----------------------------------------------------------------------------
+
+# Gerador de site de documentação a partir de Markdown
+mkdocs>=1.5.0
+
+# Tema Material para MkDocs — visual moderno e responsivo
+mkdocs-material>=9.5.0

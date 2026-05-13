@@ -1,0 +1,13 @@
+# =============================================================================
+# GreenOps Auto-Remediador — Dependências de Produção
+# =============================================================================
+# Instale com: pip install -r requirements.txt
+# Versões mínimas fixadas para garantir compatibilidade com Python 3.12
+# e com as APIs AWS utilizadas pelo projeto.
+# =============================================================================
+
+# AWS SDK — cliente principal para todos os serviços AWS
+boto3>=1.34.0
+
+# AWS SDK core — necessário para configuração de sessões e retries
+botocore>=1.34.0

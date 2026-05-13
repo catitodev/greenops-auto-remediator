@@ -1,0 +1,1344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GreenOps Auto-Remediador - Sistema serverless para descoberta e remediacao
+  automatica de recursos desperdicados na AWS, com dashboards de sustentabilidade
+  e custo. Versao 1.0.0
+
+# ==============================================================================
+# PARAMETERS
+# ==============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Ambiente de deploy
+
+  NotificationEmail:
+    Type: String
+    Description: Email para notificacoes e aprovacoes
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+  ApprovalEmail:
+    Type: String
+    Description: Email para aprovacoes de remediacao em producao
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+  DiscoverySchedule:
+    Type: String
+    Default: 'rate(6 hours)'
+    Description: Schedule para execucao do discovery (EventBridge)
+
+  RemediationSchedule:
+    Type: String
+    Default: 'rate(24 hours)'
+    Description: Schedule para execucao da remediacao (EventBridge)
+
+  ReportingSchedule:
+    Type: String
+    Default: 'cron(0 8 * * ? *)'
+    Description: Schedule para geracao de relatorios (EventBridge)
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: Memoria das funcoes Lambda em MB
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: Timeout das funcoes Lambda em segundos
+
+  FindingsTTLDays:
+    Type: Number
+    Default: 90
+    Description: TTL dos findings em dias
+
+  RollbackTTLDays:
+    Type: Number
+    Default: 30
+    Description: TTL dos registros de rollback em dias
+
+  ReportRetentionDays:
+    Type: Number
+    Default: 365
+    Description: Dias de retencao de relatorios antes de mover para Glacier
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+    Description: Retencao dos logs CloudWatch em dias
+
+# ==============================================================================
+# CONDITIONS
+# ==============================================================================
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+  IsNotProduction: !Not [!Equals [!Ref Environment, prod]]
+
+# ==============================================================================
+# RESOURCES
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # DYNAMODB TABLES
+  # ============================================================================
+
+  # Tabela principal de findings com stream habilitado
+  FindingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'greenops-findings-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: resourceId
+          AttributeType: S
+        - AttributeName: findingId
+          AttributeType: S
+        - AttributeName: resourceType
+          AttributeType: S
+        - AttributeName: discoveredAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resourceId
+          KeyType: HASH
+        - AttributeName: findingId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ResourceTypeIndex
+          KeySchema:
+            - AttributeName: resourceType
+              KeyType: HASH
+            - AttributeName: discoveredAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: greenops-auto-remediator
+        - Key: Component
+          Value: storage
+
+  # Tabela de rollbacks com TTL
+  RollbacksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'greenops-rollbacks-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: remediationId
+          AttributeType: S
+        - AttributeName: resourceId
+          AttributeType: S
+        - AttributeName: executedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: remediationId
+          KeyType: HASH
+        - AttributeName: resourceId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ResourceIdIndex
+          KeySchema:
+            - AttributeName: resourceId
+              KeyType: HASH
+            - AttributeName: executedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: greenops-auto-remediator
+        - Key: Component
+          Value: storage
+
+  # Tabela de aprovacoes
+  ApprovalsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'greenops-approvals-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: approvalId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: requestedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: approvalId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: requestedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: greenops-auto-remediator
+        - Key: Component
+          Value: storage
+
+  # Tabela de configuracao
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'greenops-config-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: configKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: configKey
+          KeyType: HASH
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: greenops-auto-remediator
+        - Key: Component
+          Value: storage
+
+  # ============================================================================
+  # S3 BUCKET
+  # ============================================================================
+
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'greenops-reports-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref ReportsBucketKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToGlacierAfter90Days
+            Status: Enabled
+            Prefix: reports/
+            Transitions:
+              - TransitionInDays: !Ref ReportRetentionDays
+                StorageClass: GLACIER
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ExpireOldLogs
+            Status: Enabled
+            Prefix: logs/
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: reports/
+            Function: !GetAtt ReportingFunction.Arn
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: greenops-auto-remediator
+        - Key: Component
+          Value: storage
+
+  ReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ReportsBucket.Arn
+              - !Sub '${ReportsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt DiscoveryFunctionRole.Arn
+                - !GetAtt RemediationFunctionRole.Arn
+                - !GetAtt ReportingFunctionRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucket'
+            Resource:
+              - !GetAtt ReportsBucket.Arn
+              - !Sub '${ReportsBucket.Arn}/*'
+
+  # ============================================================================
+  # KMS KEYS
+  # ============================================================================
+
+  ReportsBucketKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key para criptografia do bucket de relatorios GreenOps
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowLambdaUse
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt DiscoveryFunctionRole.Arn
+                - !GetAtt RemediationFunctionRole.Arn
+                - !GetAtt ReportingFunctionRole.Arn
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ReportsBucketKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/greenops-reports-${Environment}'
+      TargetKeyId: !Ref ReportsBucketKMSKey
+
+  # ============================================================================
+  # SNS TOPICS
+  # ============================================================================
+
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'greenops-notifications-${Environment}'
+      DisplayName: GreenOps Notificacoes
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: greenops-auto-remediator
+
+  ApprovalsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'greenops-approvals-${Environment}'
+      DisplayName: GreenOps Aprovacoes
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref ApprovalEmail
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: greenops-auto-remediator
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'greenops-alerts-${Environment}'
+      DisplayName: GreenOps Alertas Criticos
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: greenops-auto-remediator
+
+
+  # ============================================================================
+  # IAM ROLES - LEAST PRIVILEGE COM TAG-BASED CONDITIONS
+  # ============================================================================
+
+  # Role para Discovery Lambda
+  DiscoveryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'greenops-discovery-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DiscoveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB - escrita de findings
+              - Sid: DynamoDBFindings
+                Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !GetAtt FindingsTable.Arn
+                  - !Sub '${FindingsTable.Arn}/index/*'
+                  - !GetAtt ConfigTable.Arn
+              # EC2 - leitura de instancias (somente recursos com tag GreenOpsManaged=true)
+              - Sid: EC2ReadTagged
+                Effect: Allow
+                Action:
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:DescribeSnapshots'
+                  - 'ec2:DescribeAddresses'
+                  - 'ec2:DescribeNatGateways'
+                  - 'ec2:DescribeLoadBalancers'
+                  - 'ec2:DescribeTags'
+                Resource: '*'
+              # RDS - leitura
+              - Sid: RDSRead
+                Effect: Allow
+                Action:
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBClusters'
+                  - 'rds:ListTagsForResource'
+                Resource: '*'
+              # Lambda - leitura
+              - Sid: LambdaRead
+                Effect: Allow
+                Action:
+                  - 'lambda:ListFunctions'
+                  - 'lambda:GetFunction'
+                  - 'lambda:ListTags'
+                Resource: '*'
+              # CloudWatch - leitura de metricas
+              - Sid: CloudWatchRead
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:GetMetricData'
+                  - 'cloudwatch:ListMetrics'
+                Resource: '*'
+              # Compute Optimizer
+              - Sid: ComputeOptimizerRead
+                Effect: Allow
+                Action:
+                  - 'compute-optimizer:GetEC2InstanceRecommendations'
+                  - 'compute-optimizer:GetLambdaFunctionRecommendations'
+                  - 'compute-optimizer:GetRDSInstanceRecommendations'
+                Resource: '*'
+              # Cost Explorer
+              - Sid: CostExplorerRead
+                Effect: Allow
+                Action:
+                  - 'ce:GetCostAndUsage'
+                  - 'ce:GetRightsizingRecommendation'
+                  - 'ce:GetCostForecast'
+                Resource: '*'
+              # SNS - publicar notificacoes
+              - Sid: SNSPublish
+                Effect: Allow
+                Action: 'sns:Publish'
+                Resource:
+                  - !Ref NotificationsTopic
+                  - !Ref AlertsTopic
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Role para Remediation Lambda
+  RemediationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'greenops-remediation-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB - leitura e escrita
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !GetAtt FindingsTable.Arn
+                  - !Sub '${FindingsTable.Arn}/index/*'
+                  - !GetAtt RollbacksTable.Arn
+                  - !Sub '${RollbacksTable.Arn}/index/*'
+                  - !GetAtt ApprovalsTable.Arn
+                  - !Sub '${ApprovalsTable.Arn}/index/*'
+                  - !GetAtt ConfigTable.Arn
+              # EC2 - acoes de remediacao SOMENTE em recursos com tag GreenOpsManaged=true
+              # e Environment != Production
+              - Sid: EC2RemediateTagged
+                Effect: Allow
+                Action:
+                  - 'ec2:StopInstances'
+                  - 'ec2:ModifyInstanceAttribute'
+                  - 'ec2:DeleteVolume'
+                  - 'ec2:ReleaseAddress'
+                  - 'ec2:DeleteNatGateway'
+                  - 'ec2:CreateSnapshot'
+                  - 'ec2:CreateTags'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/GreenOpsManaged': 'true'
+                  StringNotEquals:
+                    'aws:ResourceTag/Environment': 'Production'
+              # RDS - acoes de remediacao com tag-based conditions
+              - Sid: RDSRemediateTagged
+                Effect: Allow
+                Action:
+                  - 'rds:StopDBInstance'
+                  - 'rds:ModifyDBInstance'
+                  - 'rds:AddTagsToResource'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/GreenOpsManaged': 'true'
+                  StringNotEquals:
+                    'aws:ResourceTag/Environment': 'Production'
+              # Lambda - modificar configuracoes com tag-based conditions
+              - Sid: LambdaRemediateTagged
+                Effect: Allow
+                Action:
+                  - 'lambda:UpdateFunctionConfiguration'
+                  - 'lambda:TagResource'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/GreenOpsManaged': 'true'
+                  StringNotEquals:
+                    'aws:ResourceTag/Environment': 'Production'
+              # SNS - publicar notificacoes e aprovacoes
+              - Sid: SNSPublish
+                Effect: Allow
+                Action: 'sns:Publish'
+                Resource:
+                  - !Ref NotificationsTopic
+                  - !Ref ApprovalsTopic
+                  - !Ref AlertsTopic
+              # S3 - salvar snapshots de estado para rollback
+              - Sid: S3RollbackState
+                Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: !Sub '${ReportsBucket.Arn}/rollbacks/*'
+              # Systems Manager - executar runbooks de remediacao
+              - Sid: SSMAutomation
+                Effect: Allow
+                Action:
+                  - 'ssm:StartAutomationExecution'
+                  - 'ssm:GetAutomationExecution'
+                  - 'ssm:DescribeAutomationExecutions'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/GreenOpsManaged': 'true'
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Role para Reporting Lambda
+  ReportingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'greenops-reporting-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReportingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB - leitura de todas as tabelas
+              - Sid: DynamoDBRead
+                Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !GetAtt FindingsTable.Arn
+                  - !Sub '${FindingsTable.Arn}/index/*'
+                  - !GetAtt RollbacksTable.Arn
+                  - !Sub '${RollbacksTable.Arn}/index/*'
+                  - !GetAtt ApprovalsTable.Arn
+                  - !Sub '${ApprovalsTable.Arn}/index/*'
+                  - !GetAtt ConfigTable.Arn
+              # S3 - leitura e escrita de relatorios
+              - Sid: S3Reports
+                Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt ReportsBucket.Arn
+                  - !Sub '${ReportsBucket.Arn}/*'
+              # CloudWatch - criar metricas e dashboards
+              - Sid: CloudWatchDashboards
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                  - 'cloudwatch:PutDashboard'
+                  - 'cloudwatch:GetDashboard'
+                  - 'cloudwatch:ListDashboards'
+                  - 'cloudwatch:GetMetricStatistics'
+                  - 'cloudwatch:GetMetricData'
+                Resource: '*'
+              # Cost Explorer - dados de custo
+              - Sid: CostExplorerRead
+                Effect: Allow
+                Action:
+                  - 'ce:GetCostAndUsage'
+                  - 'ce:GetCostForecast'
+                  - 'ce:GetSavingsPlansCoverage'
+                Resource: '*'
+              # Customer Carbon Footprint Tool
+              - Sid: CarbonFootprintRead
+                Effect: Allow
+                Action:
+                  - 'sustainability:GetCarbonFootprint'
+                Resource: '*'
+              # SNS - publicar relatorios
+              - Sid: SNSPublish
+                Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref NotificationsTopic
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ============================================================================
+
+  DiscoveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/greenops-discovery-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+
+  RemediationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/greenops-remediation-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+
+  ReportingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/greenops-reporting-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: GreenOpsManaged
+          Value: 'true'
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+
+  # Lambda - Discovery
+  DiscoveryFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DiscoveryLogGroup
+    Properties:
+      FunctionName: !Sub 'greenops-discovery-${Environment}'
+      Description: Descobre recursos desperdicados na AWS e registra findings
+      Runtime: python3.12
+      Handler: discovery.handler.lambda_handler
+      Role: !GetAtt DiscoveryFunctionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrentExecutions: 5
+      Architectures:
+        - arm64
+      Code:
+        ZipFile: |
+          # Placeholder - substituir pelo codigo real via CI/CD
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('Discovery placeholder')}
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          FINDINGS_TABLE: !Ref FindingsTable
+          CONFIG_TABLE: !Ref ConfigTable
+          NOTIFICATIONS_TOPIC_ARN: !Ref NotificationsTopic
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          REPORTS_BUCKET: !Ref ReportsBucket
+          FINDINGS_TTL_DAYS: !Ref FindingsTTLDays
+          LOG_LEVEL: !If [IsProduction, 'WARNING', 'INFO']
+      Layers:
+        - !Ref GreenOpsSharedLayer
+      Tags:
+        GreenOpsManaged: 'true'
+        Environment: !Ref Environment
+        Project: greenops-auto-remediator
+        Component: discovery
+
+  DiscoveryFunctionEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref DiscoveryFunction
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 2
+      DestinationConfig:
+        OnFailure:
+          Destination: !Ref AlertsTopic
+
+  # Lambda - Remediation
+  RemediationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RemediationLogGroup
+    Properties:
+      FunctionName: !Sub 'greenops-remediation-${Environment}'
+      Description: Aplica otimizacoes automaticas em recursos com tag GreenOpsManaged=true
+      Runtime: python3.12
+      Handler: remediation.handler.lambda_handler
+      Role: !GetAtt RemediationFunctionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrentExecutions: 3
+      Architectures:
+        - arm64
+      Code:
+        ZipFile: |
+          # Placeholder - substituir pelo codigo real via CI/CD
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('Remediation placeholder')}
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          FINDINGS_TABLE: !Ref FindingsTable
+          ROLLBACKS_TABLE: !Ref RollbacksTable
+          APPROVALS_TABLE: !Ref ApprovalsTable
+          CONFIG_TABLE: !Ref ConfigTable
+          NOTIFICATIONS_TOPIC_ARN: !Ref NotificationsTopic
+          APPROVALS_TOPIC_ARN: !Ref ApprovalsTopic
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          REPORTS_BUCKET: !Ref ReportsBucket
+          ROLLBACK_TTL_DAYS: !Ref RollbackTTLDays
+          REQUIRE_APPROVAL: !If [IsProduction, 'true', 'false']
+          LOG_LEVEL: !If [IsProduction, 'WARNING', 'INFO']
+      Layers:
+        - !Ref GreenOpsSharedLayer
+      Tags:
+        GreenOpsManaged: 'true'
+        Environment: !Ref Environment
+        Project: greenops-auto-remediator
+        Component: remediation
+
+  RemediationFunctionEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref RemediationFunction
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 1
+      DestinationConfig:
+        OnFailure:
+          Destination: !Ref AlertsTopic
+
+  # Lambda - Reporting
+  ReportingFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ReportingLogGroup
+    Properties:
+      FunctionName: !Sub 'greenops-reporting-${Environment}'
+      Description: Gera dashboards e relatorios de sustentabilidade e custo
+      Runtime: python3.12
+      Handler: reporting.handler.lambda_handler
+      Role: !GetAtt ReportingFunctionRole.Arn
+      MemorySize: 512
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrentExecutions: 2
+      Architectures:
+        - arm64
+      Code:
+        ZipFile: |
+          # Placeholder - substituir pelo codigo real via CI/CD
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('Reporting placeholder')}
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          FINDINGS_TABLE: !Ref FindingsTable
+          ROLLBACKS_TABLE: !Ref RollbacksTable
+          APPROVALS_TABLE: !Ref ApprovalsTable
+          CONFIG_TABLE: !Ref ConfigTable
+          NOTIFICATIONS_TOPIC_ARN: !Ref NotificationsTopic
+          REPORTS_BUCKET: !Ref ReportsBucket
+          DASHBOARD_NAME: !Sub 'GreenOps-${Environment}'
+          LOG_LEVEL: !If [IsProduction, 'WARNING', 'INFO']
+      Layers:
+        - !Ref GreenOpsSharedLayer
+      Tags:
+        GreenOpsManaged: 'true'
+        Environment: !Ref Environment
+        Project: greenops-auto-remediator
+        Component: reporting
+
+  ReportingFunctionEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ReportingFunction
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 2
+      DestinationConfig:
+        OnFailure:
+          Destination: !Ref AlertsTopic
+
+  # Lambda Layer - Shared utilities
+  GreenOpsSharedLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub 'greenops-shared-${Environment}'
+      Description: Utilitarios compartilhados entre as funcoes GreenOps
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        ZipFile: |
+          # Placeholder - substituir pelo codigo real via CI/CD
+
+  # Permissao para S3 invocar Reporting Lambda
+  ReportingFunctionS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ReportingFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ReportsBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  # Permissao para EventBridge invocar Discovery Lambda
+  DiscoveryFunctionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DiscoveryFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DiscoveryScheduleRule.Arn
+
+  # Permissao para EventBridge invocar Remediation Lambda
+  RemediationFunctionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RemediationFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RemediationScheduleRule.Arn
+
+  # Permissao para EventBridge invocar Reporting Lambda
+  ReportingFunctionEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ReportingFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReportingScheduleRule.Arn
+
+  # Permissao para DynamoDB Stream invocar Remediation Lambda
+  RemediationFunctionDynamoDBPermission:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt FindingsTable.StreamArn
+      FunctionName: !GetAtt RemediationFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 30
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: 3
+      DestinationConfig:
+        OnFailure:
+          Destination: !Ref AlertsTopic
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName": ["INSERT", "MODIFY"]}'
+
+  # ============================================================================
+  # EVENTBRIDGE SCHEDULES
+  # ============================================================================
+
+  DiscoveryScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'greenops-discovery-schedule-${Environment}'
+      Description: Executa discovery de recursos desperdicados periodicamente
+      ScheduleExpression: !Ref DiscoverySchedule
+      State: ENABLED
+      Targets:
+        - Id: DiscoveryLambdaTarget
+          Arn: !GetAtt DiscoveryFunction.Arn
+          Input: !Sub |
+            {
+              "source": "eventbridge-schedule",
+              "environment": "${Environment}",
+              "action": "full-discovery"
+            }
+
+  RemediationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'greenops-remediation-schedule-${Environment}'
+      Description: Executa remediacao automatica de recursos periodicamente
+      ScheduleExpression: !Ref RemediationSchedule
+      State: !If [IsProduction, 'DISABLED', 'ENABLED']
+      Targets:
+        - Id: RemediationLambdaTarget
+          Arn: !GetAtt RemediationFunction.Arn
+          Input: !Sub |
+            {
+              "source": "eventbridge-schedule",
+              "environment": "${Environment}",
+              "action": "auto-remediate"
+            }
+
+  ReportingScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'greenops-reporting-schedule-${Environment}'
+      Description: Gera relatorios diarios de sustentabilidade e custo
+      ScheduleExpression: !Ref ReportingSchedule
+      State: ENABLED
+      Targets:
+        - Id: ReportingLambdaTarget
+          Arn: !GetAtt ReportingFunction.Arn
+          Input: !Sub |
+            {
+              "source": "eventbridge-schedule",
+              "environment": "${Environment}",
+              "action": "generate-daily-report"
+            }
+
+
+  # ============================================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================================
+
+  # Alarm - Discovery Lambda erros
+  DiscoveryErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'greenops-discovery-errors-${Environment}'
+      AlarmDescription: Erros na funcao Lambda de discovery
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DiscoveryFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref NotificationsTopic
+
+  # Alarm - Discovery Lambda timeout
+  DiscoveryTimeoutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'greenops-discovery-timeout-${Environment}'
+      AlarmDescription: Timeout na funcao Lambda de discovery
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DiscoveryFunction
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref LambdaTimeout
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # Alarm - Remediation Lambda erros
+  RemediationErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'greenops-remediation-errors-${Environment}'
+      AlarmDescription: Erros na funcao Lambda de remediacao
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RemediationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref NotificationsTopic
+
+  # Alarm - Remediation Lambda throttles
+  RemediationThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'greenops-remediation-throttles-${Environment}'
+      AlarmDescription: Throttling na funcao Lambda de remediacao
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RemediationFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # Alarm - Reporting Lambda erros
+  ReportingErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'greenops-reporting-errors-${Environment}'
+      AlarmDescription: Erros na funcao Lambda de reporting
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReportingFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # Alarm - DynamoDB Findings throttles
+  FindingsTableThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'greenops-findings-table-throttles-${Environment}'
+      AlarmDescription: Throttling na tabela DynamoDB de findings
+      Namespace: AWS/DynamoDB
+      MetricName: SystemErrors
+      Dimensions:
+        - Name: TableName
+          Value: !Ref FindingsTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # Alarm - Custo mensal estimado (composite alarm)
+  HighCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'greenops-high-cost-${Environment}'
+      AlarmDescription: Custo estimado acima do threshold
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # ============================================================================
+  # CLOUDWATCH DASHBOARD
+  # ============================================================================
+
+  GreenOpsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'GreenOps-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# GreenOps Auto-Remediador - ${Environment}\nMonitoramento de sustentabilidade, custo e operacoes de remediacao."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "Discovery - Invocacoes e Erros",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "greenops-discovery-${Environment}", {"stat": "Sum", "period": 3600, "label": "Invocacoes"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "greenops-discovery-${Environment}", {"stat": "Sum", "period": 3600, "label": "Erros", "color": "#d62728"}]
+                ],
+                "view": "timeSeries",
+                "period": 3600,
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "Remediation - Invocacoes e Erros",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "greenops-remediation-${Environment}", {"stat": "Sum", "period": 3600, "label": "Invocacoes"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "greenops-remediation-${Environment}", {"stat": "Sum", "period": 3600, "label": "Erros", "color": "#d62728"}]
+                ],
+                "view": "timeSeries",
+                "period": 3600,
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "Reporting - Invocacoes e Erros",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "greenops-reporting-${Environment}", {"stat": "Sum", "period": 3600, "label": "Invocacoes"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "greenops-reporting-${Environment}", {"stat": "Sum", "period": 3600, "label": "Erros", "color": "#d62728"}]
+                ],
+                "view": "timeSeries",
+                "period": 3600,
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda - Duracao (p50/p95/p99)",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "greenops-discovery-${Environment}", {"stat": "p50", "period": 3600, "label": "Discovery p50"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "greenops-discovery-${Environment}", {"stat": "p99", "period": 3600, "label": "Discovery p99"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "greenops-remediation-${Environment}", {"stat": "p50", "period": 3600, "label": "Remediation p50"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "greenops-remediation-${Environment}", {"stat": "p99", "period": 3600, "label": "Remediation p99"}]
+                ],
+                "view": "timeSeries",
+                "period": 3600
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "title": "DynamoDB - Latencia de Leitura/Escrita",
+                "metrics": [
+                  ["AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "greenops-findings-${Environment}", "Operation", "PutItem", {"stat": "p99", "period": 3600, "label": "Findings PutItem p99"}],
+                  ["AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "greenops-findings-${Environment}", "Operation", "Query", {"stat": "p99", "period": 3600, "label": "Findings Query p99"}]
+                ],
+                "view": "timeSeries",
+                "period": 3600
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0, "y": 14, "width": 24, "height": 4,
+              "properties": {
+                "title": "Status dos Alarmes",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:greenops-discovery-errors-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:greenops-remediation-errors-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:greenops-reporting-errors-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:greenops-findings-table-throttles-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:greenops-high-cost-${Environment}"
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 18, "width": 12, "height": 6,
+              "properties": {
+                "title": "Custo Estimado (USD)",
+                "metrics": [
+                  ["AWS/Billing", "EstimatedCharges", "Currency", "USD", {"stat": "Maximum", "period": 86400, "label": "Custo Total Estimado"}]
+                ],
+                "view": "timeSeries",
+                "period": 86400
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 18, "width": 12, "height": 6,
+              "properties": {
+                "title": "GreenOps - Metricas Customizadas",
+                "metrics": [
+                  ["GreenOps", "FindingsDiscovered", "Environment", "${Environment}", {"stat": "Sum", "period": 86400, "label": "Findings Descobertos"}],
+                  ["GreenOps", "RemediationsApplied", "Environment", "${Environment}", {"stat": "Sum", "period": 86400, "label": "Remediações Aplicadas"}],
+                  ["GreenOps", "CostSaved", "Environment", "${Environment}", {"stat": "Sum", "period": 86400, "label": "Custo Economizado (USD)"}]
+                ],
+                "view": "timeSeries",
+                "period": 86400
+              }
+            }
+          ]
+        }
+
